@@ -12,7 +12,10 @@ import { ExpressPeerServer } from "peer";
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: { 
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    credentials: true
+  },
 });
 
 // PeerJS Server
@@ -24,7 +27,10 @@ const peerServer = ExpressPeerServer(server, {
 app.use('/peerjs', peerServer);
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
 
 // MongoDB connection
@@ -243,7 +249,7 @@ function handleUserLeave(socketId, roomId) {
   }
 }
 
-server.listen(5000, () => {
-  console.log("Server running on http://localhost:5000");
-  console.log("PeerJS server running on http://localhost:5000/peerjs");
+server.listen(process.env.PORT || 5000, () => {
+  console.log(`Server running on port ${process.env.PORT || 5000}`);
+  console.log(`PeerJS server running on port ${process.env.PORT || 5000}/peerjs`);
 });
