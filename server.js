@@ -13,8 +13,9 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { 
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-    credentials: true
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ["GET", "POST"]
   },
 });
 
@@ -27,8 +28,24 @@ const peerServer = ExpressPeerServer(server, {
 app.use('/peerjs', peerServer);
 
 // Middleware
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://psvbet-frontend.vercel.app',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('Blocked origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true
 }));
 app.use(express.json());
@@ -39,6 +56,14 @@ mongoose.connect(process.env.MONGODB_URI)
   .catch(err => console.log("MongoDB error:", err));
 
 // Routes
+app.get("/", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    message: "PSVBet Backend API",
+    allowedOrigins: allowedOrigins
+  });
+});
+
 app.use("/api/auth", authRoutes);
 app.use("/api/meeting", meetingRoutes);
 
