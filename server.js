@@ -11,6 +11,14 @@ import { ExpressPeerServer } from "peer";
 
 const app = express();
 const server = http.createServer(app);
+
+// Define allowed origins first
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://psvbet-frontend.vercel.app',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
 const io = new Server(server, {
   cors: { 
     origin: allowedOrigins,
@@ -28,12 +36,6 @@ const peerServer = ExpressPeerServer(server, {
 app.use('/peerjs', peerServer);
 
 // Middleware
-const allowedOrigins = [
-  'http://localhost:3000',
-  'https://psvbet-frontend.vercel.app',
-  process.env.FRONTEND_URL
-].filter(Boolean);
-
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
