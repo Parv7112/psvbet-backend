@@ -1,0 +1,249 @@
+import "dotenv/config";
+import express from "express";
+import http from "http";
+import axios from "axios";
+import { Server } from "socket.io";
+import mongoose from "mongoose";
+import cors from "cors";
+import authRoutes from "./routes/auth.js";
+import meetingRoutes from "./routes/meeting.js";
+import { ExpressPeerServer } from "peer";
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" },
+});
+
+// PeerJS Server
+const peerServer = ExpressPeerServer(server, {
+  debug: true,
+  path: '/'
+});
+
+app.use('/peerjs', peerServer);
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch(err => console.log("MongoDB error:", err));
+
+// Routes
+app.use("/api/auth", authRoutes);
+app.use("/api/meeting", meetingRoutes);
+
+let latestOdds = null;
+
+// async function fetchOdds() {
+//   try {
+//     const response = await axios.get(
+//       "https://api.the-odds-api.com/v4/sports/cricket/odds",
+//       {
+//         params: {
+//           apiKey: "5dfd4e1176e26a76bebc517302c2649e",
+//           regions: "uk",
+//           markets: "h2h",
+//           oddsFormat: "decimal",
+//         },
+//       }
+//     );
+
+//     const matches = response.data.map((match) => {
+//       const bookmaker = match.bookmakers?.[0];
+//       const market = bookmaker?.markets?.find(
+//         (m) => m.key === "h2h"
+//       );
+
+//       return {
+//         teamA: match.home_team,
+//         teamB: match.away_team,
+//         odds: market?.outcomes?.map((o) => ({
+//           name: o.name,
+//           price: o.price,
+//         })),
+//         bookmaker: bookmaker?.title || "Unknown",
+//       };
+//     });
+
+//     latestOdds = { matches };
+
+//     io.emit("odds_update", latestOdds);
+
+//     console.log("Odds updated:", matches.length);
+
+//   } catch (err) {
+//     console.log("Status:", err.response?.status);
+//     console.log("Error:", err.response?.data || err.message);
+//   }
+// }
+
+// Fetch every 10 seconds (free tier friendly)
+// setInterval(fetchOdds, 10000);
+
+// Store active meetings and participants
+const meetings = new Map();
+
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+  
+  if (latestOdds) {
+    socket.emit("odds_update", latestOdds);
+  }
+
+  socket.on("join-meeting", async (data) => {
+    const { roomId, userName, peerId, userId } = data;
+    
+    console.log(`[JOIN] ${userName} (peer: ${peerId}) joining room ${roomId}, userId: ${userId}`);
+    
+    if (!meetings.has(roomId)) {
+      meetings.set(roomId, []);
+    }
+    
+    const usersInRoom = meetings.get(roomId);
+    
+    // Remove any old entries for this user (handles reconnections)
+    // For logged-in users, check by userId; for guests, check by socketId
+    if (userId) {
+      const oldUserIndex = usersInRoom.findIndex(u => u.userId === userId);
+      if (oldUserIndex !== -1) {
+        console.log(`[JOIN] Removing old entry for user ${userName}`);
+        const oldUser = usersInRoom.splice(oldUserIndex, 1)[0];
+        // Notify others that old peer left
+        io.to(roomId).emit("user-left", oldUser.peerId);
+      }
+    }
+    
+    // Check if this user is the host
+    let isHost = false;
+    try {
+      const Meeting = (await import('./models/Meeting.js')).default;
+      const meeting = await Meeting.findOne({ roomId });
+      console.log(`[JOIN] Meeting hostId: ${meeting?.hostId}, userId: ${userId}`);
+      
+      if (meeting && userId && meeting.hostId.toString() === userId.toString()) {
+        isHost = true;
+        console.log(`[JOIN] ${userName} is the HOST`);
+      } else {
+        console.log(`[JOIN] ${userName} is a PARTICIPANT`);
+      }
+    } catch (err) {
+      console.log("Error checking host:", err);
+    }
+    
+    // Add new user
+    const newUser = { socketId: socket.id, peerId, userName, isHost, userId };
+    usersInRoom.push(newUser);
+    socket.join(roomId);
+    
+    // Find the host in the room
+    const host = usersInRoom.find(u => u.isHost);
+    
+    if (isHost) {
+      // If joining user is host, send them all participants
+      usersInRoom.forEach(user => {
+        if (user.peerId !== peerId) {
+          socket.emit("user-joined", { 
+            peerId: user.peerId, 
+            userName: user.userName,
+            isHost: user.isHost 
+          });
+        }
+      });
+      
+      // Notify all participants that host joined
+      socket.to(roomId).emit("user-joined", { 
+        peerId, 
+        userName,
+        isHost: true 
+      });
+    } else {
+      // If joining user is participant
+      // Send them only the host
+      if (host && host.peerId !== peerId) {
+        socket.emit("user-joined", { 
+          peerId: host.peerId, 
+          userName: host.userName,
+          isHost: true 
+        });
+      }
+      
+      // Notify only the host about new participant
+      if (host) {
+        io.to(host.socketId).emit("user-joined", { 
+          peerId, 
+          userName,
+          isHost: false 
+        });
+      }
+    }
+    
+    console.log(`[JOIN] ${userName} (${isHost ? 'HOST' : 'PARTICIPANT'}) joined. Total: ${usersInRoom.length}`);
+  });
+
+  socket.on("leave-meeting", (data) => {
+    const { roomId } = data;
+    handleUserLeave(socket.id, roomId);
+  });
+
+  socket.on("start-private-call", (data) => {
+    const { roomId, targetPeerId, fromPeerId, fromUserName } = data;
+    console.log(`[PRIVATE] ${fromUserName} starting private call with ${targetPeerId}`);
+    
+    // Find the target user's socket
+    const usersInRoom = meetings.get(roomId) || [];
+    const targetUser = usersInRoom.find(u => u.peerId === targetPeerId);
+    
+    if (targetUser) {
+      io.to(targetUser.socketId).emit("private-call-request", {
+        fromPeerId,
+        fromUserName
+      });
+    }
+  });
+
+  socket.on("end-private-call", (data) => {
+    const { roomId, targetPeerId } = data;
+    console.log(`[PRIVATE] Ending private call with ${targetPeerId}`);
+    
+    // Find the target user's socket
+    const usersInRoom = meetings.get(roomId) || [];
+    const targetUser = usersInRoom.find(u => u.peerId === targetPeerId);
+    
+    if (targetUser) {
+      io.to(targetUser.socketId).emit("private-call-ended");
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+    meetings.forEach((users, roomId) => {
+      handleUserLeave(socket.id, roomId);
+    });
+  });
+});
+
+function handleUserLeave(socketId, roomId) {
+  if (meetings.has(roomId)) {
+    const users = meetings.get(roomId);
+    const index = users.findIndex(u => u.socketId === socketId);
+    
+    if (index !== -1) {
+      const leftUser = users.splice(index, 1)[0];
+      io.to(roomId).emit("user-left", leftUser.peerId);
+      console.log(`[LEAVE] ${leftUser.userName} left. Remaining: ${users.length}`);
+      
+      if (users.length === 0) {
+        meetings.delete(roomId);
+      }
+    }
+  }
+}
+
+server.listen(5000, () => {
+  console.log("Server running on http://localhost:5000");
+  console.log("PeerJS server running on http://localhost:5000/peerjs");
+});
