@@ -13,6 +13,11 @@ const meetingSchema = new mongoose.Schema({
   },
   hostName: String,
   title: String,
+  selectedMatch: {
+    matchId: String,
+    matchName: String,
+    league: String
+  },
   isActive: {
     type: Boolean,
     default: true

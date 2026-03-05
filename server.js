@@ -7,6 +7,8 @@ import mongoose from "mongoose";
 import cors from "cors";
 import authRoutes from "./routes/auth.js";
 import meetingRoutes from "./routes/meeting.js";
+import clientRoutes from "./routes/client.js";
+import cricketRoutes from "./routes/cricket.js";
 import { ExpressPeerServer } from "peer";
 
 const app = express();
@@ -25,6 +27,10 @@ const io = new Server(server, {
     credentials: true,
     methods: ["GET", "POST"]
   },
+  transports: ['polling'], // Polling only to avoid WebSocket issues
+  maxHttpBufferSize: 1e8,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // PeerJS Server
@@ -68,6 +74,8 @@ app.get("/", (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/meeting", meetingRoutes);
+app.use("/api/client", clientRoutes);
+app.use("/api/cricket", cricketRoutes);
 
 let latestOdds = null;
 
@@ -139,15 +147,21 @@ io.on("connection", (socket) => {
     const usersInRoom = meetings.get(roomId);
     
     // Remove any old entries for this user (handles reconnections)
-    // For logged-in users, check by userId; for guests, check by socketId
+    let removedOldPeer = false;
     if (userId) {
       const oldUserIndex = usersInRoom.findIndex(u => u.userId === userId);
       if (oldUserIndex !== -1) {
         console.log(`[JOIN] Removing old entry for user ${userName}`);
         const oldUser = usersInRoom.splice(oldUserIndex, 1)[0];
+        removedOldPeer = true;
         // Notify others that old peer left
-        io.to(roomId).emit("user-left", oldUser.peerId);
+        socket.to(roomId).emit("user-left", oldUser.peerId);
       }
+    }
+    
+    // Small delay if we removed an old peer to ensure cleanup completes
+    if (removedOldPeer) {
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
     
     // Check if this user is the host
@@ -176,15 +190,14 @@ io.on("connection", (socket) => {
     const host = usersInRoom.find(u => u.isHost);
     
     if (isHost) {
-      // If joining user is host, send them all participants
-      usersInRoom.forEach(user => {
-        if (user.peerId !== peerId) {
-          socket.emit("user-joined", { 
-            peerId: user.peerId, 
-            userName: user.userName,
-            isHost: user.isHost 
-          });
-        }
+      // If joining user is host, send them all participants (excluding themselves)
+      const otherUsers = usersInRoom.filter(user => user.peerId !== peerId);
+      otherUsers.forEach(user => {
+        socket.emit("user-joined", { 
+          peerId: user.peerId, 
+          userName: user.userName,
+          isHost: user.isHost 
+        });
       });
       
       // Notify all participants that host joined
@@ -249,6 +262,17 @@ io.on("connection", (socket) => {
     if (targetUser) {
       io.to(targetUser.socketId).emit("private-call-ended");
     }
+  });
+
+  socket.on("share-odds", (data) => {
+    const { roomId } = data;
+    console.log(`[ODDS] Sharing odds in room ${roomId}`, data);
+    console.log(`[ODDS] Broadcasting to room ${roomId}`);
+    
+    // Broadcast odds to all users in the room (including sender for confirmation)
+    io.to(roomId).emit("odds-update", data);
+    
+    console.log(`[ODDS] Odds broadcasted successfully`);
   });
 
   socket.on("disconnect", () => {
