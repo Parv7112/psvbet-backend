@@ -23,10 +23,21 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 function isAllowedOrigin(origin) {
+  // In local/dev, allow all origins so multiple devices (LAN IPs) can connect.
+  if (process.env.NODE_ENV !== "production") return true;
+
   if (!origin) return true;
   if (allowedOrigins.includes(origin)) return true;
+
+  const extra = (process.env.ADDITIONAL_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (extra.includes(origin)) return true;
+
   // Allow Vercel preview deployments (common source of “works locally, breaks deployed”)
   if (origin.endsWith(".vercel.app")) return true;
+
   return false;
 }
 
@@ -36,7 +47,7 @@ const io = new Server(server, {
     credentials: true,
     methods: ["GET", "POST"]
   },
-  transports: ['polling'], // Polling only to avoid WebSocket issues
+  transports: ['websocket', 'polling'],
   maxHttpBufferSize: 1e8,
   pingTimeout: 60000,
   pingInterval: 25000
