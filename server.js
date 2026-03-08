@@ -5,6 +5,7 @@ import axios from "axios";
 import { Server } from "socket.io";
 import mongoose from "mongoose";
 import cors from "cors";
+import path from "path";
 import authRoutes from "./routes/auth.js";
 import meetingRoutes from "./routes/meeting.js";
 import clientRoutes from "./routes/client.js";
@@ -57,6 +58,7 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI)
@@ -76,6 +78,34 @@ app.use("/api/auth", authRoutes);
 app.use("/api/meeting", meetingRoutes);
 app.use("/api/client", clientRoutes);
 app.use("/api/cricket", cricketRoutes);
+
+// ICE config for WebRTC (STUN/TURN)
+app.get("/api/ice", (req, res) => {
+  const iceServers = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+  ];
+
+  const turnUrls = process.env.TURN_URLS || process.env.TURN_URL;
+  const turnUsername = process.env.TURN_USERNAME;
+  const turnCredential = process.env.TURN_CREDENTIAL;
+
+  if (turnUrls && turnUsername && turnCredential) {
+    const urls = turnUrls
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (urls.length) {
+      iceServers.push({
+        urls: urls.length === 1 ? urls[0] : urls,
+        username: turnUsername,
+        credential: turnCredential
+      });
+    }
+  }
+
+  res.json({ iceServers });
+});
 
 let latestOdds = null;
 
