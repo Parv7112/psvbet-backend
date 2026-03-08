@@ -49,7 +49,8 @@ const io = new Server(server, {
     credentials: true,
     methods: ["GET", "POST", "OPTIONS"]
   },
-  transports: ['websocket', 'polling'],
+  // Polling requires sticky sessions across instances. WebSocket avoids "Session ID unknown".
+  transports: ['websocket'],
   maxHttpBufferSize: 1e8,
   pingTimeout: 60000,
   pingInterval: 25000
