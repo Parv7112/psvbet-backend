@@ -87,14 +87,44 @@ router.get("/match/:id", async (req, res) => {
       });
     }
 
-    const response = await fetch(`https://apiv2.api-cricket.com/cricket/?method=get_events&APIkey=${apiKey}&event_key=${req.params.id}`);
-    const data = await response.json();
+    const eventKey = String(req.params.id);
 
-    if (!response.ok) {
-      throw new Error(data.message || "Failed to fetch match details");
+    // get_events is good for metadata/scorecard/comments but often lags for live score.
+    // get_livescore is the source of truth for live-updating scores.
+    const [liveResponse, eventsResponse] = await Promise.all([
+      fetch(`https://apiv2.api-cricket.com/cricket/?method=get_livescore&APIkey=${apiKey}`),
+      fetch(`https://apiv2.api-cricket.com/cricket/?method=get_events&APIkey=${apiKey}&event_key=${eventKey}`)
+    ]);
+
+    const [liveData, eventsData] = await Promise.all([
+      liveResponse.json(),
+      eventsResponse.json()
+    ]);
+
+    if (!eventsResponse.ok) {
+      throw new Error(eventsData.message || "Failed to fetch match details");
     }
 
-    res.json(data);
+    const eventMatch = Array.isArray(eventsData.result) ? eventsData.result[0] : null;
+    const liveMatch = Array.isArray(liveData.result)
+      ? liveData.result.find(m => String(m.event_key) === eventKey)
+      : null;
+
+    // Merge: event metadata + live score overrides
+    const merged = {
+      ...(eventMatch || {}),
+      ...(liveMatch || {})
+    };
+
+    // Keep same API shape as upstream
+    res.json({
+      ...eventsData,
+      result: merged && Object.keys(merged).length ? [merged] : (eventsData.result || []),
+      info: {
+        ...(eventsData.info || {}),
+        mergedLive: !!liveMatch
+      }
+    });
   } catch (error) {
     console.error("Cricket API error:", error);
     res.status(500).json({ 
