@@ -1,8 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import http from "http";
-import crypto from "crypto";
-import { WebSocketServer } from "ws";
+import axios from "axios";
+import { Server } from "socket.io";
 import mongoose from "mongoose";
 import cors from "cors";
 import path from "path";
@@ -10,6 +10,7 @@ import authRoutes from "./routes/auth.js";
 import meetingRoutes from "./routes/meeting.js";
 import clientRoutes from "./routes/client.js";
 import cricketRoutes from "./routes/cricket.js";
+import { ExpressPeerServer } from "peer";
 
 const app = express();
 const server = http.createServer(app);
@@ -22,23 +23,24 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 function isAllowedOrigin(origin) {
-  // In local/dev, allow all origins so multiple devices (LAN IPs) can connect.
-  if (process.env.NODE_ENV !== "production") return true;
-
   if (!origin) return true;
   if (allowedOrigins.includes(origin)) return true;
-
-  const extra = (process.env.ADDITIONAL_ORIGINS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  if (extra.includes(origin)) return true;
-
   // Allow Vercel preview deployments (common source of “works locally, breaks deployed”)
   if (origin.endsWith(".vercel.app")) return true;
-
   return false;
 }
+
+const io = new Server(server, {
+  cors: { 
+    origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
+    credentials: true,
+    methods: ["GET", "POST"]
+  },
+  transports: ['polling'], // Polling only to avoid WebSocket issues
+  maxHttpBufferSize: 1e8,
+  pingTimeout: 60000,
+  pingInterval: 25000
+});
 
 // Middleware
 app.use(cors({
@@ -52,6 +54,14 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+// PeerJS Server (mount AFTER CORS middleware)
+const peerServer = ExpressPeerServer(server, {
+  debug: true,
+  path: '/',
+  proxied: true
+});
+app.use('/peerjs', peerServer);
 
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI)
@@ -148,181 +158,182 @@ let latestOdds = null;
 // Fetch every 10 seconds (free tier friendly)
 // setInterval(fetchOdds, 10000);
 
-// -------------------------
-// WebSocket realtime server
-// -------------------------
-const wss = new WebSocketServer({ server, path: "/ws" });
+// Store active meetings and participants
+const meetings = new Map();
 
-const wsById = new Map();      // id -> ws
-const metaById = new Map();    // id -> {id, roomId, userName, userId, isHost}
-const roomMembers = new Map(); // roomId -> Set<id>
-
-function wsSend(ws, msg) {
-  try {
-    ws.send(JSON.stringify(msg));
-  } catch {
-    // ignore
-  }
-}
-
-function broadcastRoom(roomId, msg, excludeId = null) {
-  const members = roomMembers.get(roomId);
-  if (!members) return;
-  for (const id of members) {
-    if (excludeId && id === excludeId) continue;
-    const ws = wsById.get(id);
-    if (ws && ws.readyState === 1) wsSend(ws, msg);
-  }
-}
-
-function removeFromRoom(id) {
-  const meta = metaById.get(id);
-  if (!meta?.roomId) return;
-  const roomId = meta.roomId;
-  const members = roomMembers.get(roomId);
-  if (members) {
-    members.delete(id);
-    if (members.size === 0) roomMembers.delete(roomId);
-  }
-  meta.roomId = null;
-  metaById.set(id, meta);
-  broadcastRoom(roomId, { type: "user-left", id }, id);
-}
-
-wss.on("connection", (ws, req) => {
-  const origin = req.headers.origin;
-  if (!isAllowedOrigin(origin)) {
-    try { ws.close(1008, "Origin not allowed"); } catch {}
-    return;
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+  
+  if (latestOdds) {
+    socket.emit("odds_update", latestOdds);
   }
 
-  const id = typeof crypto.randomUUID === "function"
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString("hex");
-
-  wsById.set(id, ws);
-  metaById.set(id, { id, roomId: null, userName: null, userId: null, isHost: false });
-  wsSend(ws, { type: "ws-hello", id });
-
-  ws.on("message", async (raw) => {
-    let msg;
+  socket.on("join-meeting", async (data) => {
+    const { roomId, userName, peerId, userId } = data;
+    
+    console.log(`[JOIN] ${userName} (peer: ${peerId}) joining room ${roomId}, userId: ${userId}`);
+    
+    if (!meetings.has(roomId)) {
+      meetings.set(roomId, []);
+    }
+    
+    const usersInRoom = meetings.get(roomId);
+    
+    // Remove any old entries for this user (handles reconnections)
+    let removedOldPeer = false;
+    if (userId) {
+      const oldUserIndex = usersInRoom.findIndex(u => u.userId === userId);
+      if (oldUserIndex !== -1) {
+        console.log(`[JOIN] Removing old entry for user ${userName}`);
+        const oldUser = usersInRoom.splice(oldUserIndex, 1)[0];
+        removedOldPeer = true;
+        // Notify others that old peer left
+        socket.to(roomId).emit("user-left", oldUser.peerId);
+      }
+    }
+    
+    // Small delay if we removed an old peer to ensure cleanup completes
+    if (removedOldPeer) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    // Check if this user is the host
+    let isHost = false;
     try {
-      msg = JSON.parse(String(raw));
-    } catch {
-      return;
-    }
-
-    const meta = metaById.get(id);
-    if (!meta) return;
-
-    const { type, requestId } = msg || {};
-
-    if (type === "join-meeting") {
-      const { roomId, userName, userId } = msg || {};
-      if (!roomId || !userName) {
-        wsSend(ws, { type: "ack", requestId, ok: false, message: "Missing roomId/userName" });
-        return;
-      }
-
-      removeFromRoom(id);
-
-      let isHost = false;
-      try {
-        const Meeting = (await import("./models/Meeting.js")).default;
-        const meeting = await Meeting.findOne({ roomId });
-        if (meeting && userId && meeting.hostId.toString() === String(userId)) {
-          isHost = true;
-        }
-      } catch {
-        // ignore
-      }
-
-      meta.roomId = roomId;
-      meta.userName = userName;
-      meta.userId = userId || null;
-      meta.isHost = isHost;
-      metaById.set(id, meta);
-
-      if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Set());
-      roomMembers.get(roomId).add(id);
-
-      const members = Array.from(roomMembers.get(roomId))
-        .map(mid => metaById.get(mid))
-        .filter(Boolean);
-      const host = members.find(m => m.isHost);
-
-      if (isHost) {
-        const others = members.filter(m => m.id !== id);
-        wsSend(ws, { type: "join-state", users: others.map(u => ({ id: u.id, userName: u.userName, isHost: u.isHost })) });
-        broadcastRoom(roomId, { type: "user-joined", id, userName, isHost: true }, id);
+      const Meeting = (await import('./models/Meeting.js')).default;
+      const meeting = await Meeting.findOne({ roomId });
+      console.log(`[JOIN] Meeting hostId: ${meeting?.hostId}, userId: ${userId}`);
+      
+      if (meeting && userId && meeting.hostId.toString() === userId.toString()) {
+        isHost = true;
+        console.log(`[JOIN] ${userName} is the HOST`);
       } else {
-        if (host) {
-          wsSend(ws, { type: "user-joined", id: host.id, userName: host.userName, isHost: true });
-          const hostWs = wsById.get(host.id);
-          if (hostWs && hostWs.readyState === 1) {
-            wsSend(hostWs, { type: "user-joined", id, userName, isHost: false });
-          }
-        }
+        console.log(`[JOIN] ${userName} is a PARTICIPANT`);
       }
-
-      wsSend(ws, { type: "ack", requestId, ok: true, id, roomId, isHost });
-      return;
+    } catch (err) {
+      console.log("Error checking host:", err);
     }
-
-    if (type === "leave-meeting") {
-      removeFromRoom(id);
-      wsSend(ws, { type: "ack", requestId, ok: true });
-      return;
+    
+    // Add new user
+    const newUser = { socketId: socket.id, peerId, userName, isHost, userId };
+    usersInRoom.push(newUser);
+    socket.join(roomId);
+    
+    // Find the host in the room
+    const host = usersInRoom.find(u => u.isHost);
+    
+    if (isHost) {
+      // If joining user is host, send them all participants (excluding themselves)
+      const otherUsers = usersInRoom.filter(user => user.peerId !== peerId);
+      otherUsers.forEach(user => {
+        socket.emit("user-joined", { 
+          peerId: user.peerId, 
+          userName: user.userName,
+          isHost: user.isHost 
+        });
+      });
+      
+      // Notify all participants that host joined
+      socket.to(roomId).emit("user-joined", { 
+        peerId, 
+        userName,
+        isHost: true 
+      });
+    } else {
+      // If joining user is participant
+      // Send them only the host
+      if (host && host.peerId !== peerId) {
+        socket.emit("user-joined", { 
+          peerId: host.peerId, 
+          userName: host.userName,
+          isHost: true 
+        });
+      }
+      
+      // Notify only the host about new participant
+      if (host) {
+        io.to(host.socketId).emit("user-joined", { 
+          peerId, 
+          userName,
+          isHost: false 
+        });
+      }
     }
+    
+    console.log(`[JOIN] ${userName} (${isHost ? 'HOST' : 'PARTICIPANT'}) joined. Total: ${usersInRoom.length}`);
+  });
 
-    if (type === "signal") {
-      const { to, data } = msg || {};
-      if (!meta.roomId || !to || !data) return;
-      const toWs = wsById.get(to);
-      const toMeta = metaById.get(to);
-      if (!toWs || toWs.readyState !== 1) return;
-      if (!toMeta || toMeta.roomId !== meta.roomId) return;
-      wsSend(toWs, { type: "signal", from: id, data });
-      return;
-    }
+  socket.on("leave-meeting", (data) => {
+    const { roomId } = data;
+    handleUserLeave(socket.id, roomId);
+  });
 
-    if (type === "share-odds") {
-      if (!meta.roomId) return;
-      broadcastRoom(meta.roomId, { type: "odds-update", ...msg }, null);
-      return;
-    }
-
-    if (type === "start-private-call") {
-      const { targetId, fromUserName } = msg || {};
-      if (!meta.roomId || !targetId) return;
-      const tWs = wsById.get(targetId);
-      const tMeta = metaById.get(targetId);
-      if (!tWs || tWs.readyState !== 1) return;
-      if (!tMeta || tMeta.roomId !== meta.roomId) return;
-      wsSend(tWs, { type: "private-call-request", fromId: id, fromUserName: fromUserName || meta.userName });
-      return;
-    }
-
-    if (type === "end-private-call") {
-      const { targetId } = msg || {};
-      if (!meta.roomId || !targetId) return;
-      const tWs = wsById.get(targetId);
-      const tMeta = metaById.get(targetId);
-      if (!tWs || tWs.readyState !== 1) return;
-      if (!tMeta || tMeta.roomId !== meta.roomId) return;
-      wsSend(tWs, { type: "private-call-ended" });
-      return;
+  socket.on("start-private-call", (data) => {
+    const { roomId, targetPeerId, fromPeerId, fromUserName } = data;
+    console.log(`[PRIVATE] ${fromUserName} starting private call with ${targetPeerId}`);
+    
+    // Find the target user's socket
+    const usersInRoom = meetings.get(roomId) || [];
+    const targetUser = usersInRoom.find(u => u.peerId === targetPeerId);
+    
+    if (targetUser) {
+      io.to(targetUser.socketId).emit("private-call-request", {
+        fromPeerId,
+        fromUserName
+      });
     }
   });
 
-  ws.on("close", () => {
-    removeFromRoom(id);
-    wsById.delete(id);
-    metaById.delete(id);
+  socket.on("end-private-call", (data) => {
+    const { roomId, targetPeerId } = data;
+    console.log(`[PRIVATE] Ending private call with ${targetPeerId}`);
+    
+    // Find the target user's socket
+    const usersInRoom = meetings.get(roomId) || [];
+    const targetUser = usersInRoom.find(u => u.peerId === targetPeerId);
+    
+    if (targetUser) {
+      io.to(targetUser.socketId).emit("private-call-ended");
+    }
+  });
+
+  socket.on("share-odds", (data) => {
+    const { roomId } = data;
+    console.log(`[ODDS] Sharing odds in room ${roomId}`, data);
+    console.log(`[ODDS] Broadcasting to room ${roomId}`);
+    
+    // Broadcast odds to all users in the room (including sender for confirmation)
+    io.to(roomId).emit("odds-update", data);
+    
+    console.log(`[ODDS] Odds broadcasted successfully`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+    meetings.forEach((users, roomId) => {
+      handleUserLeave(socket.id, roomId);
+    });
   });
 });
 
+function handleUserLeave(socketId, roomId) {
+  if (meetings.has(roomId)) {
+    const users = meetings.get(roomId);
+    const index = users.findIndex(u => u.socketId === socketId);
+    
+    if (index !== -1) {
+      const leftUser = users.splice(index, 1)[0];
+      io.to(roomId).emit("user-left", leftUser.peerId);
+      console.log(`[LEAVE] ${leftUser.userName} left. Remaining: ${users.length}`);
+      
+      if (users.length === 0) {
+        meetings.delete(roomId);
+      }
+    }
+  }
+}
+
 server.listen(process.env.PORT || 5000, () => {
   console.log(`Server running on port ${process.env.PORT || 5000}`);
-  console.log("WebSocket server available at /ws");
+  console.log(`PeerJS server running on port ${process.env.PORT || 5000}/peerjs`);
 });
