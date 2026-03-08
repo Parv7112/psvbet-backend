@@ -42,15 +42,28 @@ function isAllowedOrigin(origin) {
 }
 
 const io = new Server(server, {
-  cors: { 
-    origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
+  // For realtime, be permissive on origin; we still restrict HTTP APIs via express CORS below.
+  // This avoids production-only socket connect failures due to subtle origin mismatches.
+  cors: {
+    origin: true,
     credentials: true,
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST", "OPTIONS"]
   },
   transports: ['websocket', 'polling'],
   maxHttpBufferSize: 1e8,
   pingTimeout: 60000,
   pingInterval: 25000
+});
+
+// Log low-level Socket.IO connection errors (very helpful for diagnosing prod)
+io.engine.on("connection_error", (err) => {
+  console.log("[SOCKET.IO] connection_error", {
+    code: err.code,
+    message: err.message,
+    context: err.context,
+    origin: err.req?.headers?.origin,
+    referer: err.req?.headers?.referer
+  });
 });
 
 // Middleware
