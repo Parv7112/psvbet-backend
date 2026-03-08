@@ -179,7 +179,7 @@ io.on("connection", (socket) => {
     socket.emit("odds_update", latestOdds);
   }
 
-  socket.on("join-meeting", async (data) => {
+  socket.on("join-meeting", async (data, ack) => {
     const { roomId, userName, peerId, userId } = data;
     
     console.log(`[JOIN] ${userName} (peer: ${peerId}) joining room ${roomId}, userId: ${userId}`);
@@ -272,6 +272,17 @@ io.on("connection", (socket) => {
     }
     
     console.log(`[JOIN] ${userName} (${isHost ? 'HOST' : 'PARTICIPANT'}) joined. Total: ${usersInRoom.length}`);
+
+    if (typeof ack === "function") {
+      ack({
+        ok: true,
+        socketId: socket.id,
+        roomId,
+        peerId,
+        isHost,
+        usersInRoom: usersInRoom.map(u => ({ peerId: u.peerId, userName: u.userName, isHost: u.isHost }))
+      });
+    }
   });
 
   socket.on("leave-meeting", (data) => {
