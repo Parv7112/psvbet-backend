@@ -1,6 +1,8 @@
 import express from "express";
 import { authMiddleware } from "../middleware/auth.js";
+import { clientAuthMiddleware } from "../middleware/clientAuth.js";
 import Meeting from "../models/Meeting.js";
+import Client from "../models/Client.js";
 import crypto from "crypto";
 import multer from "multer";
 import fs from "fs";
@@ -63,6 +65,59 @@ router.get("/user/my-meetings", authMiddleware, async (req, res) => {
       .limit(20);
     
     res.json(meetings);
+  } catch (error) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/client/my-meetings", clientAuthMiddleware, async (req, res) => {
+  try {
+    const client = await Client.findById(req.clientDocId);
+    if (!client) {
+      return res.status(404).json({ message: "Client not found" });
+    }
+    const meetings = await Meeting.find({ hostId: client.createdBy })
+      .sort({ createdAt: -1 })
+      .limit(50);
+    res.json(meetings);
+  } catch (error) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/recordings-by-client", authMiddleware, async (req, res) => {
+  try {
+    const clients = await Client.find({ createdBy: req.userId }).sort({ name: 1 }).lean();
+    const meetings = await Meeting.find({ hostId: req.userId })
+      .select("roomId title recordings createdAt")
+      .lean();
+
+    const out = clients.map((client) => {
+      const cid = client._id.toString();
+      const segments = [];
+      for (const m of meetings) {
+        for (const r of m.recordings || []) {
+          if (r.recordingSource !== "client") continue;
+          const rid = r.clientDocId ? String(r.clientDocId) : "";
+          if (rid !== cid) continue;
+          segments.push({
+            ...r,
+            meetingTitle: m.title,
+            roomId: m.roomId
+          });
+        }
+      }
+      segments.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return {
+        clientMongoId: cid,
+        clientLoginId: client.clientId,
+        name: client.name,
+        number: client.number,
+        segments
+      };
+    });
+
+    res.json({ clients: out });
   } catch (error) {
     res.status(500).json({ message: "Server error" });
   }
@@ -155,6 +210,7 @@ router.post(
 
     meeting.recordings = meeting.recordings || [];
     meeting.recordings.push({
+      recordingSource: "host",
       byUserId: req.userId,
       byName,
       filename: recordingFile.filename,
@@ -181,6 +237,66 @@ router.post(
     res.status(500).json({ message: "Failed to upload recording" });
   }
 });
+
+router.post(
+  "/:roomId/client-recordings",
+  clientAuthMiddleware,
+  recordingUpload.fields([{ name: "recording", maxCount: 1 }]),
+  async (req, res) => {
+    try {
+      const meeting = await Meeting.findOne({ roomId: req.params.roomId });
+      if (!meeting) return res.status(404).json({ message: "Meeting not found" });
+
+      const client = await Client.findById(req.clientDocId);
+      if (!client) return res.status(404).json({ message: "Client not found" });
+      if (client.createdBy.toString() !== meeting.hostId.toString()) {
+        return res.status(403).json({ message: "Not authorized for this meeting" });
+      }
+
+      const recordingFile = req.files?.recording?.[0];
+      if (!recordingFile) {
+        return res.status(400).json({ message: "Missing recording file" });
+      }
+
+      const relativePath = path.posix.join(
+        "meetings",
+        req.params.roomId,
+        recordingFile.filename
+      );
+
+      let segmentStartedAt;
+      if (req.body.segmentStartedAt) {
+        const d = new Date(req.body.segmentStartedAt);
+        if (!Number.isNaN(d.getTime())) segmentStartedAt = d;
+      }
+
+      meeting.recordings = meeting.recordings || [];
+      meeting.recordings.push({
+        recordingSource: "client",
+        clientDocId: client._id,
+        clientLoginId: client.clientId,
+        segmentStartedAt: segmentStartedAt || undefined,
+        byName: client.name,
+        filename: recordingFile.filename,
+        relativePath,
+        mimeType: recordingFile.mimetype,
+        sizeBytes: recordingFile.size
+      });
+
+      await meeting.save();
+
+      const recording = meeting.recordings[meeting.recordings.length - 1];
+      res.json({
+        recording: {
+          ...(recording.toObject?.() ?? recording),
+          url: `/uploads/${relativePath}`
+        }
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to upload client recording" });
+    }
+  }
+);
 
 router.post("/:roomId/recordings/:recordingId/transcribe", authMiddleware, async (req, res) => {
   try {

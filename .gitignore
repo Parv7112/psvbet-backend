@@ -2,8 +2,6 @@
 node_modules/
 
 # Environment variables
-.env
-.env.local
 .env.development.local
 .env.test.local
 .env.production.local
@@ -22,7 +20,6 @@ lerna-debug.log*
 Thumbs.db
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -39,3 +36,7 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat

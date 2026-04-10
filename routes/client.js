@@ -1,7 +1,20 @@
 import express from "express";
+import jwt from "jsonwebtoken";
 import { authMiddleware } from "../middleware/auth.js";
 import Client from "../models/Client.js";
+import User from "../models/User.js";
 import crypto from "crypto";
+
+function signClientToken(client) {
+  return jwt.sign(
+    {
+      type: "client",
+      clientDocId: client._id.toString()
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+}
 
 const router = express.Router();
 
@@ -123,13 +136,45 @@ router.post("/verify", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
+      token: signClientToken(client),
       client: {
         id: client._id,
         clientId: client.clientId,
         name: client.name
       }
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Same as verify, plus host display name — used by client portal login
+router.post("/login", async (req, res) => {
+  try {
+    const { clientId, password } = req.body;
+
+    if (!clientId || !password) {
+      return res.status(400).json({ message: "Client ID and password are required" });
+    }
+
+    const client = await Client.findOne({ clientId, password });
+
+    if (!client) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const host = await User.findById(client.createdBy).select("name").lean();
+
+    res.json({
+      token: signClientToken(client),
+      client: {
+        id: client._id,
+        clientId: client.clientId,
+        name: client.name
+      },
+      adminName: host?.name || ""
     });
   } catch (error) {
     res.status(500).json({ message: "Server error" });

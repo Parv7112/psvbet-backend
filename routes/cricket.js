@@ -110,11 +110,30 @@ router.get("/match/:id", async (req, res) => {
       ? liveData.result.find(m => String(m.event_key) === eventKey)
       : null;
 
-    // Merge: event metadata + live score overrides
-    const merged = {
-      ...(eventMatch || {}),
-      ...(liveMatch || {})
-    };
+    function countCommentBalls(comments) {
+      if (!comments || typeof comments !== "object") return 0;
+      return Object.values(comments).reduce(
+        (n, v) => n + (Array.isArray(v) ? v.length : 0),
+        0
+      );
+    }
+
+    // Merge: live score fields, but do not replace detailed comments with undefined / emptier payloads
+    const merged = { ...(eventMatch || {}) };
+    if (liveMatch && Object.keys(liveMatch).length) {
+      for (const [k, v] of Object.entries(liveMatch)) {
+        if (k === "comments") continue;
+        if (v !== undefined) merged[k] = v;
+      }
+      const evC = eventMatch?.comments;
+      const lvC = liveMatch?.comments;
+      if (lvC) {
+        if (!evC || countCommentBalls(lvC) >= countCommentBalls(evC)) merged.comments = lvC;
+        else merged.comments = evC;
+      } else if (evC) {
+        merged.comments = evC;
+      }
+    }
 
     // Keep same API shape as upstream
     res.json({
