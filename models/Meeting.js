@@ -32,6 +32,17 @@ const meetingSchema = new mongoose.Schema({
       type: Date,
       default: Date.now
     },
+    recordingSource: {
+      type: String,
+      enum: ["host", "client"],
+      default: "host"
+    },
+    clientDocId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Client"
+    },
+    clientLoginId: String,
+    segmentStartedAt: Date,
     byUserId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User"
